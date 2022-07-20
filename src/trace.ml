@@ -604,44 +604,71 @@ module Make_commands (Backend : Backend_intf.S) = struct
              decode_opts))
   ;;
 
-  let select_pid () =
-    if force supports_fzf
-    then (
-      let deselect_pid_args pid =
-        let pid = Pid.to_string pid in
-        [ "--ppid"; pid; "-p"; pid; "--deselect" ]
-      in
-      (* There are no Linux APIs, or OCaml libraries that I've found, for enumerating
+  module Ps = struct
+    type t =
+      { pid : Pid.t
+      ; ppid : string
+      ; description : string
+      }
+
+    (* Even though kthreadd is a process, we can't attach to it because it doesn't have a [/proc/$PID/exe] file.*)
+    let is_kernel_thread t = String.( = ) t.ppid "2" || Pid.equal t.pid (Pid.of_int 2)
+    let to_string t = Pid.to_string t.pid ^ " " ^ t.description
+
+    let parse input =
+      let input = String.lstrip input in
+      let lst = String.lsplit2 input ~on:' ' in
+      match lst with
+      | Some (pid, remainder) ->
+        let lst_two = String.lsplit2 (String.lstrip remainder) ~on:' ' in
+        (match lst_two with
+         | Some (ppid, description) ->
+           Core.print_endline description;
+           let new_t = { pid = Pid.of_string pid; ppid; description } in
+           new_t
+         | None -> failwith "Error with Remainder/description")
+      | None -> failwith "Unable to create PS"
+    ;;
+  end
+
+  let build_task_by_pid_map () =
+    (* There are no Linux APIs, or OCaml libraries that I've found, for enumerating
        running processes. The [ps] command uses the /proc/ filesystem and is much easier
        than walking the /proc/ system and filtering ourselves. *)
-      let process_lines =
-        [ [ "x"; "-w"; "--no-headers" ]
-        ; [ "-o"; "pid,args" ]
-          (* If running as root, allow tracing all processes, including those owned
+    let process_lines_args =
+      [ [ "x"; "-w"; "--no-headers" ]
+      ; [ "-o"; "pid,ppid,args" ]
+        (* If running as root, allow tracing all processes, including those owned
              by non-root users.
 
              Hide kernel threads (PID 2 and children), since though we can trace them in
              theory, in practice they don't have their image under /proc/$pid/exe, which
              we currently rely on. *)
-        ; (if Core_unix.geteuid () = 0 then deselect_pid_args (Pid.of_int 2) else [])
-        ]
-        |> List.concat
-        |> Shell.run_lines "ps"
+      ]
+      |> List.concat
+    in
+    let process_lines = process_lines_args |> Shell.run_lines "ps" in
+    let tasks = List.map process_lines ~f:Ps.parse in
+    let pids_and_process : (Pid.t * Ps.t) list =
+      List.map tasks ~f:(fun process -> process.Ps.pid, process)
+    in
+    Pid.Map.of_alist_exn pids_and_process
+  ;;
+
+  let select_task task_by_pid =
+    if force supports_fzf
+    then (
+      let tasks =
+        Map.to_alist task_by_pid
+        |> List.map ~f:(fun ((_ : Pid.t), task) -> Ps.to_string task, task)
       in
-      let%bind.Deferred.Or_error sel_line =
-        Fzf.pick_one (Fzf.Pick_from.Inputs process_lines)
-      in
-      let pid =
-        let%bind.Option sel_line = sel_line in
-        let sel_line = String.lstrip sel_line in
-        let%map.Option first_part = String.split ~on:' ' sel_line |> List.hd in
-        Pid.of_string first_part
-      in
-      match pid with
-      | Some s -> Deferred.return (Ok s)
+      let%bind.Deferred.Or_error process = Fzf.pick_one (Fzf.Pick_from.Assoc tasks) in
+      match process with
+      | Some process -> Deferred.return (Ok process)
       | None -> Deferred.Or_error.error_string "No pid selected")
     else
       Deferred.Or_error.error_string
+        (* error: magic-trace can only attach to kernel threads when run as root ??*)
         "The [-pid] argument is mandatory. magic-trace could show you a fuzzy-finding \
          selector here if \"fzf\" were in your PATH, but it is not."
   ;;
@@ -672,46 +699,63 @@ module Make_commands (Backend : Backend_intf.S) = struct
        fun () ->
          let open Deferred.Or_error.Let_syntax in
          let%bind () = check_for_perf () in
-         let%bind (pids : Pid.t list) =
-           match pids with
-           | None -> select_pid () |> Deferred.Or_error.map ~f:(fun pid -> [ pid ])
-           | Some pids -> return (List.map ~f:Pid.of_int pids)
-         in
-         if List.contains_dup pids ~compare:Pid.compare
-         then Deferred.Or_error.error_string "Duplicate PIDs were passed"
-         else (
-           (* Always use the head PID for locating triggers since only a single
-              trigger can be passed currently. *)
-           let executable =
-             List.hd_exn pids
-             |> fun pid -> Core_unix.readlink [%string "/proc/%{pid#Pid}/exe"]
+         let (task_by_pid : Ps.t Pid.Map.t) = build_task_by_pid_map () in
+         let%bind (tasks : Ps.t list) =
+           let has_duplicate_pid pids = List.contains_dup pids ~compare:Int.compare in
+           let find_task_by_pid pid =
+             match Map.find task_by_pid pid with
+             | None ->
+               Deferred.Or_error.error_s
+                 [%message "No process found with this pid" (pid : Pid.t)]
+             | Some task -> Deferred.Or_error.return task
            in
-           record_opt_fn ~executable ~f:(fun opts ->
-             let { Record_opts.executable; when_to_snapshot; collection_mode; _ } =
-               opts
-             in
-             let%bind elf = create_elf ~executable ~when_to_snapshot in
-             let%bind range_symbols =
-               evaluate_trace_filter ~trace_filter:opts.trace_filter ~elf
-             in
-             let%bind () =
-               attach_and_record
-                 opts
-                 ~elf
-                 ~debug_print_perf_commands
-                 ~collection_mode
-                 pids
-             in
-             let%bind.Deferred perf_maps = Perf_map.Table.load_by_pids pids in
-             decode_to_trace
-               ~perf_maps
-               ?range_symbols
-               ~elf
-               ~trace_scope:opts.trace_scope
-               ~debug_print_perf_commands
-               ~record_dir:opts.record_dir
-               ~collection_mode
-               decode_opts)))
+           match pids with
+           | None ->
+             select_task task_by_pid |> Deferred.Or_error.map ~f:(fun task -> [ task ])
+           | Some pids when has_duplicate_pid pids ->
+             Deferred.Or_error.error_string "Duplicate PIDs were passed"
+           | Some pids ->
+             let pids = List.map pids ~f:Pid.of_int in
+             Deferred.Or_error.List.map ~f:find_task_by_pid pids
+         in
+         (* Always use the head PID for locating triggers since only a single
+              trigger can be passed currently. *)
+         let%bind executable =
+           let task = List.hd_exn tasks in
+           match Ps.is_kernel_thread task with
+           | true ->
+             (match Perf_capabilities.supports_tracing_kernel () with
+              | true ->
+                Deferred.Or_error.error_string
+                  "error: magic-trace does yet not support the [-trigger] flag when \
+                   attaching to a kernel thread"
+              | false ->
+                Deferred.Or_error.error_string
+                  "error: magic-trace can only attach to kernel threads when run as root")
+           | false ->
+             Deferred.Or_error.return
+               (Core_unix.readlink [%string "/proc/%{task.pid#Pid}/exe"])
+         in
+         let pids = List.map tasks ~f:(fun task -> task.pid) in
+         record_opt_fn ~executable ~f:(fun opts ->
+           let { Record_opts.executable; when_to_snapshot; collection_mode; _ } = opts in
+           let%bind elf = create_elf ~executable ~when_to_snapshot in
+           let%bind range_symbols =
+             evaluate_trace_filter ~trace_filter:opts.trace_filter ~elf
+           in
+           let%bind () =
+             attach_and_record opts ~elf ~debug_print_perf_commands ~collection_mode pids
+           in
+           let%bind.Deferred perf_maps = Perf_map.Table.load_by_pids pids in
+           decode_to_trace
+             ~perf_maps
+             ?range_symbols
+             ~elf
+             ~trace_scope:opts.trace_scope
+             ~debug_print_perf_commands
+             ~record_dir:opts.record_dir
+             ~collection_mode
+             decode_opts))
   ;;
 
   let decode_command =

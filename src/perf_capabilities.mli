@@ -12,3 +12,4 @@ val snapshot_on_exit : t
 val last_branch_record : t
 val dlfilter : t
 val detect_exn : unit -> t Deferred.t
+val supports_tracing_kernel : unit -> bool
