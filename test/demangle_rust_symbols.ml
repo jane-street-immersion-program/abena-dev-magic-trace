@@ -1,146 +1,158 @@
 open! Core
-open! Magic_trace_lib
+open Magic_trace_core
 
-(* Create a list of the escape sequences. Make them a constant. The list will be a string * char list. Create a parser that will make this a string
-   string parser.t. Run on then parser by using *> on each parser and then turning it to the character. Then have a choice function that will return a singular string *)
-module Constants = struct
-  let escape_sequences =
-    [ "$C$", ","
-    ; "$SP$", "@"
-    ; "$BP$", "*"
-    ; "$RF$", "&"
-    ; "$LT$", "<"
-    ; "$GT$", ">"
-    ; "$LP$", "("
-    ; "$RP$", ")"
-    ]
-  ;;
-end
-
-let decode_two_digit_hexadecimal_number first_character second_character =
-  let%bind.Option hex_digit_of_first_character = Char.get_hex_digit first_character in
-  let%bind.Option hex_digit_of_second_character = Char.get_hex_digit second_character in
-  let leftshift_first_character = Int.shift_left hex_digit_of_first_character 4 in
-  let bit_or_on_the_hexadecimals =
-    Int.bit_or leftshift_first_character hex_digit_of_second_character
+let demangle_symbol_test (input, expected) =
+  let demangle_symbol =
+    Demangle_rust_symbols.demangle_symbol input
+    |> Result.map_error ~f:(String.( ^ ) input)
+    |> Result.ok_or_failwith
   in
-  match Char.of_int bit_or_on_the_hexadecimals with
-  | Some integer -> Some (Char.to_string integer)
-  | None -> None
+  match String.( = ) demangle_symbol expected with
+  | true -> ()
+  | false ->
+    print_s
+      [%message
+        "unexpectedly got"
+          (demangle_symbol : string)
+          "when we were expecting"
+          (expected : string)]
 ;;
 
-let first_parser =
-  let open Angstrom in
-  let open Angstrom.Let_syntax in
-  let number = Char.is_digit in
-  let int_of_string = take_while1 number in
-  let%bind string_to_int = int_of_string in
-  let integer_in_string = Int.of_string string_to_int in
-  print_s [%sexp (integer_in_string : int)];
-  take integer_in_string
+let demangle_symbol_test_error input =
+  let demangle_symbol = Demangle_rust_symbols.demangle_symbol input in
+  match demangle_symbol with
+  | Error _ -> ()
+  | Ok symbol -> print_string symbol
 ;;
 
-let splits_parser =
-  let open Angstrom in
-  let remove_ZN = string "_ZN" *> return None in
-  let remove__ZN = string "__ZN" *> return None in
-  let removeZN = string "ZN" *> return None in
-  (* let remove_first_underscore = string "_$" *> return (Some "$") in *)
-  let prefix =
-    choice ~failure_msg:"unrecognized prefix" [ remove_ZN; remove__ZN; removeZN ]
-  in
-  prefix *> many1 first_parser <* char 'E' *> end_of_input
+let%expect_test "demangle" =
+  demangle_symbol_test_error "test";
+  demangle_symbol_test ("_ZN4testE", "test");
+  demangle_symbol_test_error "_ZN4test";
+  demangle_symbol_test ("_ZN4test1a2bcE", "test::a::bc");
+  [%expect {| |}]
 ;;
 
-let decode_parser =
-  let open Angstrom in
-  let open Angstrom.Let_syntax in
-  let unescape_characters =
-    List.map Constants.escape_sequences ~f:(fun (escape_sequence, new_char) ->
-      string escape_sequence *> return (Some new_char))
-  in
-  let period_to_dash = [ (string "." >>| fun _ -> Some "-") ] in
-  let remove_first_underscore =
-    peek_string 2
-    >>= fun first_two_characters ->
-    match first_two_characters with
-    | None -> fail "No _$ found"
-    | Some starter_string -> if String.equal starter_string "_$" then return (Some "$")
-  in
-  let periods_to_semicolon = [ (string ".." >>| fun _ -> Some "::") ] in
-  let two_digit_hexadecimal_number =
-    let hex_character = satisfy Char.is_hex_digit in
-    let hexcode =
-      decode_two_digit_hexadecimal_number
-      <$> string "$u" *> hex_character
-      <*> hex_character
-      <* string "$"
-    in
-    [ (hexcode
-      >>= fun integer ->
-      match integer with
-      | None -> fail "invalid integer"
-      | Some character -> return (Some character))
-    ]
-  in
-  let normal_character =
-    [ (any_char >>| fun character -> Some (Char.to_string character)) ]
-  in
-  let strip_h_suffix =
-    string "h" *> skip_while Char.is_hex_digit *> end_of_input *> return None
-  in
-  let token =
-    choice
-      ~failure_msg:"unrecognized token"
-      (unescape_characters
-      @ remove_first_underscore
-      @ two_digit_hexadecimal_number
-      @ periods_to_semicolon
-      @ period_to_dash
-      @ normal_character)
-  in
-  let tokens =
-    many1 token
-    >>| fun tokens -> tokens |> List.filter_map ~f:Fn.id |> String.concat |> Some
-  in
-  strip_h_suffix <|> tokens
+let%expect_test "demangle_dollars" =
+  demangle_symbol_test ("_ZN4$RP$E", ")");
+  demangle_symbol_test ("_ZN8$RF$testE", "&test");
+  demangle_symbol_test ("_ZN8$BP$test4foobE", "*test::foob");
+  demangle_symbol_test ("_ZN9$u20$test4foobE", " test::foob");
+  demangle_symbol_test ("_ZN35Bar$LT$$u5b$u32$u3b$$u20$4$u5d$$GT$E", "Bar<[u32; 4]>");
+  [%expect {| |}]
 ;;
 
-let demangle mangled_symbol =
-  let mangled_string = Angstrom.parse_string ~consume:All splits_parser mangled_symbol in
-  let split =
-    match mangled_string with
-    | Ok list -> Some (List.map list ~f:Fn.id)
-    | Error _ -> None
-  in
-  print_s [%message (split : string list option)];
-  match split with
-  | Some symbol ->
-    Some
-      (List.filter_map symbol ~f:(fun str ->
-         match Angstrom.parse_string ~consume:All decode_parser str with
-         | Ok list -> list
-         | Error _ -> None)
-      |> String.concat ~sep:"::")
-  | None -> None
+let%expect_test "demangle_many_dollars" =
+  demangle_symbol_test ("_ZN13test$u20$test4foobE", "test test::foob");
+  demangle_symbol_test ("_ZN12test$BP$test4foobE", "test*test::foob");
+  [%expect {| |}]
 ;;
 
-let demangle_symbol_test symbol =
-  let demangle_symbol = demangle symbol in
-  print_s [%sexp (demangle_symbol : string option)]
+let%expect_test "demangle_windows" =
+  demangle_symbol_test ("ZN4testE", "test");
+  demangle_symbol_test ("ZN13test$u20$test4foobE", "test test::foob");
+  demangle_symbol_test ("ZN12test$RF$test4foobE", "test&test::foob");
+  [%expect {| |}]
 ;;
 
-let%expect_test "real mangled symbol" =
+let%expect_test "demangle_elements_beginning_with_underscore" =
+  demangle_symbol_test ("_ZN13_$LT$test$GT$E", "<test>");
+  demangle_symbol_test ("_ZN28_$u7b$$u7b$closure$u7d$$u7d$E", "{{closure}}");
+  demangle_symbol_test ("_ZN15__STATIC_FMTSTRE", "__STATIC_FMTSTR");
+  [%expect {| |}]
+;;
+
+let%expect_test "demangle_trait_impls" =
   demangle_symbol_test
-    "__ZN38_$LT$core..option..Option$LT$T$GT$$GT$6unwrap18_MSG_FILE_LINE_COL17haf7cb8d5824ee659E";
+    ( "_ZN71_$LT$Test$u20$$u2b$$u20$$u27$static$u20$as$u20$foo..Bar$LT$Test$GT$$GT$3barE"
+    , "<Test + 'static as foo::Bar<Test>>::bar" );
+  [%expect {| |}]
+;;
+
+let%expect_test "demangle_without_hash" =
+  let s = "_ZN3foo17h05af221e174051e9E" in
+  demangle_symbol_test (s, "foo");
+  [%expect {| |}]
+;;
+
+let%expect_test "demangle_without_hash_edgecases" =
+  (* One element, no hash. *)
+  demangle_symbol_test ("_ZN3fooE", "foo");
+  (* Two elements, no hash. *)
+  demangle_symbol_test ("_ZN3foo3barE", "foo::bar");
+  (* Longer-than-normal hash. *)
+  demangle_symbol_test ("_ZN3foo20h05af221e174051e9abcE", "foo");
+  (* Shorter-than-normal hash. *)
+  demangle_symbol_test ("_ZN3foo5h05afE", "foo");
+  (* Valid hash, but not at the end. *)
+  demangle_symbol_test ("_ZN17h05af221e174051e93fooE", "h05af221e174051e9::foo");
+  (* Not a valid hash, missing the 'h'. *)
+  demangle_symbol_test ("_ZN3foo16ffaf221e174051e9E", "foo::ffaf221e174051e9");
+  (* Not a valid hash, has a non-hex-digit *)
+  demangle_symbol_test ("_ZN3foo17hg5af221e174051e9E", "foo::hg5af221e174051e9");
+  [%expect {| |}]
+;;
+
+let%expect_test "demangle_thinlto" =
+  (* One element, no hash. *)
+  demangle_symbol_test ("_ZN3fooE.llvm.9D1C9369", "foo");
+  demangle_symbol_test ("_ZN3fooE.llvm.9D1C9369@@16", "foo");
+  demangle_symbol_test
+    ("_ZN9backtrace3foo17hbb467fcdaea5d79bE.llvm.A5310EB9", "backtrace::foo");
+  [%expect {| |}]
+;;
+
+let%expect_test "demangle_llvm_ir_branch_labels" =
+  demangle_symbol_test
+    ( "_ZN4core5slice77_$LT$impl$u20$core..ops..index..IndexMut$LT$I$GT$$u20$for$u20$$u5b$T$u5d$$GT$9index_mut17haf9727c2edfbc47bE.exit.i.i"
+    , "core::slice::<impl core::ops::index::IndexMut<I> for [T]>::index_mut.exit.i.i" );
+  [%expect {| |}]
+;;
+
+let%expect_test "demangle_ignores_suffix_that_doesnt_look_like_a_symbol" =
+  demangle_symbol_test_error "_ZN3fooE.llvm moocow";
+  [%expect {|
+    foo |}]
+;;
+
+let%expect_test "invalid_no_chop" =
+  demangle_symbol_test_error "_ZNfooE";
+  [%expect {| |}]
+;;
+
+let%expect_test "handle_assoc_types" =
+  demangle_symbol_test
+    ( "_ZN151_$LT$alloc..boxed..Box$LT$alloc..boxed..FnBox$LT$A$C$$u20$Output$u3d$R$GT$$u20$$u2b$$u20$$u27$a$GT$$u20$as$u20$core..ops..function..FnOnce$LT$A$GT$$GT$9call_once17h69e8f44b3723e1caE"
+    , "<alloc::boxed::Box<alloc::boxed::FnBox<A, Output=R> + 'a> as \
+       core::ops::function::FnOnce<A>>::call_once" );
+  [%expect {| |}]
+;;
+
+let%expect_test "handle_bang" =
+  demangle_symbol_test
+    ( "_ZN88_$LT$core..result..Result$LT$$u21$$C$$u20$E$GT$$u20$as$u20$std..process..Termination$GT$6report17hfc41d0da4a40b3e8E"
+    , "<core::result::Result<!, E> as std::process::Termination>::report" );
+  [%expect {| |}]
+;;
+
+(* This case was not implemented. Useful for future iterations of demangling rust symbols*)
+let%expect_test "demangle_utf8_idents" =
+  demangle_symbol_test
+    ( "_ZN11utf8_idents157_$u10e1$$u10d0$$u10ed$$u10db$$u10d4$$u10da$$u10d0$$u10d3$_$u10d2$$u10d4$$u10db$$u10e0$$u10d8$$u10d4$$u10da$$u10d8$_$u10e1$$u10d0$$u10d3$$u10d8$$u10da$$u10d8$17h21634fd5714000aaE"
+    , "utf8_idents::საჭმელად_გემრიელი_სადილი" );
   [%expect
     {|
-    38
-    6
-    18
-    17
-    (split
-     ((_$LT$core..option..Option$LT$T$GT$$GT$ unwrap _MSG_FILE_LINE_COL
-       haf7cb8d5824ee659)))
-    (LT$core::option::Option<T>>::unwrap::_MSG_FILE_LINE_COL) |}]
+    ("unexpectedly got"
+     (demangle_symbol
+      utf8_idents::$u10e1$$u10d0$$u10ed$$u10db$$u10d4$$u10da$$u10d0$$u10d3$$u10d2$$u10d4$$u10db$$u10e0$$u10d8$$u10d4$$u10da$$u10d8$$u10e1$$u10d0$$u10d3$$u10d8$$u10da$$u10d8$)
+     "when we were expecting"
+     (expected
+      "utf8_idents::\225\131\161\225\131\144\225\131\173\225\131\155\225\131\148\225\131\154\225\131\144\225\131\147_\225\131\146\225\131\148\225\131\155\225\131\160\225\131\152\225\131\148\225\131\154\225\131\152_\225\131\161\225\131\144\225\131\147\225\131\152\225\131\154\225\131\152")) |}]
+;;
+
+let%expect_test "demangle_issue_60925" =
+  demangle_symbol_test
+    ( "_ZN11issue_609253foo37Foo$LT$issue_60925..llv$u6d$..Foo$GT$3foo17h059a991a004536adE"
+    , "issue_60925::foo::Foo<issue_60925::llvm::Foo>::foo" );
+  [%expect {| |}]
 ;;
