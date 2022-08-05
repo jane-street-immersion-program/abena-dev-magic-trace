@@ -50,12 +50,12 @@ let select_within_file ~elf ~header symbol =
   | Some chosen_name -> return chosen_name
 ;;
 
-let evaluate ~supports_fzf ~elf ~header symbol_selection =
+let evaluate ~supports_fzf ~attachable ~header symbol_selection =
   let open Deferred.Or_error.Let_syntax in
   let%bind elf =
-    match elf with
+    match attachable with
     | None -> Deferred.Or_error.error_string "No ELF found"
-    | Some elf -> return elf
+    | Some attachable -> return attachable
   in
   let%bind () =
     if force supports_fzf

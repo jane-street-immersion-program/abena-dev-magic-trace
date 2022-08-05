@@ -45,7 +45,7 @@ let create_elf ~executable ~(when_to_snapshot : When_to_snapshot.t) =
   | Magic_trace_or_the_application_terminates, _ | _, Some _ -> return (Ok elf)
 ;;
 
-let evaluate_trace_filter ~(trace_filter : Trace_filter.Unevaluated.t option) ~elf =
+let evaluate_trace_filter ~(trace_filter : Trace_filter.Unevaluated.t option) ~attachable =
   let open Deferred.Or_error.Let_syntax in
   match trace_filter with
   | None -> return None
@@ -53,14 +53,14 @@ let evaluate_trace_filter ~(trace_filter : Trace_filter.Unevaluated.t option) ~e
     let%bind start_symbol =
       Symbol_selection.evaluate
         ~supports_fzf
-        ~elf
+        ~attachable
         ~header:"Range filter start symbol"
         start_symbol
     in
     let%map stop_symbol =
       Symbol_selection.evaluate
         ~supports_fzf
-        ~elf
+        ~attachable
         ~header:"Range filter stop symbol"
         stop_symbol
     in
@@ -311,7 +311,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
            let%bind symbol_name =
              Symbol_selection.evaluate
                ~supports_fzf
-               ~elf:(Some elf)
+               ~attachable:(Some (Elf elf))
                ~header:"Snapshot symbol"
                symbol_selection
            in
@@ -580,7 +580,10 @@ module Make_commands (Backend : Backend_intf.S) = struct
          record_opt_fn ~executable ~f:(fun opts ->
            let elf = Elf.create opts.executable in
            let%bind range_symbols =
-             evaluate_trace_filter ~trace_filter:opts.trace_filter ~elf
+             evaluate_trace_filter
+               ~trace_filter:opts.trace_filter
+               ~attachable:
+                 (Option.map elf ~f:(fun elf -> Symbol_selection.Attachable.Elf elf))
            in
            let%bind pid =
              let argv = prog :: List.concat (Option.to_list argv) in
@@ -729,6 +732,7 @@ module Make_commands (Backend : Backend_intf.S) = struct
                 Deferred.Or_error.error_string
                   "error: magic-trace does yet not support the [-trigger] flag when \
                    attaching to a kernel thread"
+                (*display list of symbols from the proc/kallsysm file*)
               | false ->
                 Deferred.Or_error.error_string
                   "error: magic-trace can only attach to kernel threads when run as root")
