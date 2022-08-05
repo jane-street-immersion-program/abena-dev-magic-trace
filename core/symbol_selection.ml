@@ -5,6 +5,16 @@ type t =
   | Use_fzf_to_select_one of [ `File | `Func | `File_or_func ]
   | User_selected of string
 
+module Kallsyms = struct
+  type t = unit
+end
+
+module Attachable = struct
+  type t =
+    | Elf of Elf.t
+    | Kallsyms of Kallsyms.t
+end
+
 let of_command_string s =
   match s with
   | "?" -> Use_fzf_to_select_one `File_or_func

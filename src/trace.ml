@@ -745,7 +745,10 @@ module Make_commands (Backend : Backend_intf.S) = struct
            let { Record_opts.executable; when_to_snapshot; collection_mode; _ } = opts in
            let%bind elf = create_elf ~executable ~when_to_snapshot in
            let%bind range_symbols =
-             evaluate_trace_filter ~trace_filter:opts.trace_filter ~elf
+             evaluate_trace_filter
+               ~trace_filter:opts.trace_filter
+               ~attachable:
+                 (Option.map elf ~f:(fun elf -> Symbol_selection.Attachable.Elf elf))
            in
            let%bind () =
              attach_and_record opts ~elf ~debug_print_perf_commands ~collection_mode pids
